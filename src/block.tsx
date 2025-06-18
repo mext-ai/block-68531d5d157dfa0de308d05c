@@ -22,7 +22,7 @@ interface User {
   cursor?: { x: number; y: number };
 }
 
-const COLORS = ['#FF6B6B', '#4ECDC4', '#45B7D1'];
+const COLORS = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7', '#DDA0DD'];
 
 const Block: React.FC<BlockProps> = ({ title = "Collaborative Whiteboard", description }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -31,34 +31,54 @@ const Block: React.FC<BlockProps> = ({ title = "Collaborative Whiteboard", descr
   const [peer, setPeer] = useState<Peer | null>(null);
   const [connections, setConnections] = useState<Map<string, any>>(new Map());
   const [users, setUsers] = useState<Map<string, User>>(new Map());
-  const [isConnected, setIsConnected] = useState(false);
+  const [connectionStatus, setConnectionStatus] = useState<'disconnected' | 'connecting' | 'connected'>('disconnected');
   const [roomId, setRoomId] = useState('');
   const [myUserId, setMyUserId] = useState('');
   const [userCursors, setUserCursors] = useState<Map<string, { x: number; y: number }>>(new Map());
+  const [lastMousePos, setLastMousePos] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
 
   // Generate room ID based on current page
   useEffect(() => {
-    const baseRoomId = window.location.href.replace(/[^a-zA-Z0-9]/g, '').substring(0, 50);
-    setRoomId(`whiteboard-${baseRoomId}`);
+    const baseRoomId = window.location.href
+      .replace(/[^a-zA-Z0-9]/g, '')
+      .substring(0, 30);
+    setRoomId(`wb-${baseRoomId}`);
+  }, []);
+
+  // Assign user a random color
+  useEffect(() => {
+    const randomColor = COLORS[Math.floor(Math.random() * COLORS.length)];
+    setSelectedColor(randomColor);
   }, []);
 
   // Initialize PeerJS
   useEffect(() => {
     if (!roomId) return;
 
-    const newPeer = new Peer({
+    setConnectionStatus('connecting');
+
+    // Create a unique peer ID for this room
+    const uniquePeerId = `${roomId}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+
+    const newPeer = new Peer(uniquePeerId, {
       host: 'social.mext.app',
       port: 443,
       path: '/mext',
       key: 'mexty',
-      secure: true
+      secure: true,
+      config: {
+        iceServers: [
+          { urls: 'stun:stun.l.google.com:19302' },
+          { urls: 'stun:global.stun.twilio.com:3478' }
+        ]
+      }
     });
 
     newPeer.on('open', (id) => {
       console.log('My peer ID is: ' + id);
       setMyUserId(id);
       setPeer(newPeer);
-      setIsConnected(true);
+      setConnectionStatus('connected');
       
       // Add myself to users
       const myUser: User = {
@@ -67,60 +87,109 @@ const Block: React.FC<BlockProps> = ({ title = "Collaborative Whiteboard", descr
       };
       setUsers(prev => new Map(prev.set(id, myUser)));
 
-      // Try to connect to existing peers in the room
-      connectToRoom(newPeer, id);
+      // Start room discovery
+      startRoomDiscovery(newPeer, id);
     });
 
     newPeer.on('connection', (conn) => {
+      console.log('Incoming connection from:', conn.peer);
       setupConnection(conn);
     });
 
     newPeer.on('error', (err) => {
       console.error('Peer error:', err);
-      setIsConnected(false);
+      setConnectionStatus('connecting');
+      
+      // Retry connection after a delay
+      setTimeout(() => {
+        if (newPeer.destroyed) return;
+        newPeer.reconnect();
+      }, 2000);
+    });
+
+    newPeer.on('disconnected', () => {
+      console.log('Peer disconnected');
+      setConnectionStatus('connecting');
+      newPeer.reconnect();
     });
 
     return () => {
       newPeer.destroy();
+      setConnectionStatus('disconnected');
     };
-  }, [roomId]);
+  }, [roomId, selectedColor]);
 
-  const connectToRoom = (peerInstance: Peer, myId: string) => {
-    // In a real implementation, you'd have a signaling server
-    // For now, we'll use a simple approach where peers try to connect to known IDs
-    // This is a simplified version - in production you'd want a proper room management system
-    
-    // Try to connect to other potential peers
-    const potentialPeerIds = Array.from({ length: 5 }, (_, i) => `${roomId}-${i}`);
-    
-    potentialPeerIds.forEach(peerId => {
-      if (peerId !== myId) {
-        setTimeout(() => {
-          try {
-            const conn = peerInstance.connect(peerId);
-            if (conn) {
-              setupConnection(conn);
-            }
-          } catch (err) {
-            // Peer doesn't exist, that's fine
+  const startRoomDiscovery = (peerInstance: Peer, myId: string) => {
+    // Use a simple discovery mechanism
+    // In production, you'd want a proper signaling server
+    const discoveryInterval = setInterval(() => {
+      // Try to connect to potential peers in the same room
+      const timestamp = Date.now();
+      const timeWindow = 30000; // 30 seconds window
+      
+      // Generate potential peer IDs within a time window
+      for (let i = 0; i < 10; i++) {
+        const potentialTime = timestamp - (i * 3000); // Check every 3 seconds back
+        const basePeerId = `${roomId}-${Math.floor(potentialTime / 10000) * 10000}`;
+        
+        // Try a few variations
+        for (let j = 0; j < 3; j++) {
+          const potentialPeerId = `${basePeerId}-${j}`;
+          if (potentialPeerId !== myId && !connections.has(potentialPeerId)) {
+            tryConnectToPeer(peerInstance, potentialPeerId);
           }
-        }, Math.random() * 1000);
+        }
       }
-    });
+    }, 5000);
+
+    // Clear interval after 2 minutes
+    setTimeout(() => {
+      clearInterval(discoveryInterval);
+    }, 120000);
+
+    return () => clearInterval(discoveryInterval);
+  };
+
+  const tryConnectToPeer = (peerInstance: Peer, peerId: string) => {
+    try {
+      console.log('Attempting to connect to:', peerId);
+      const conn = peerInstance.connect(peerId, {
+        reliable: true,
+        metadata: { roomId, userId: myUserId }
+      });
+
+      if (conn) {
+        conn.on('open', () => {
+          console.log('Successfully connected to:', peerId);
+          setupConnection(conn);
+        });
+
+        conn.on('error', (err) => {
+          console.log('Failed to connect to:', peerId, err);
+        });
+      }
+    } catch (err) {
+      console.log('Connection attempt failed:', peerId, err);
+    }
   };
 
   const setupConnection = (conn: any) => {
     conn.on('open', () => {
-      console.log('Connected to peer:', conn.peer);
+      console.log('Connection established with:', conn.peer);
       setConnections(prev => new Map(prev.set(conn.peer, conn)));
       
       // Send my user info
       conn.send({
-        type: 'user-info',
+        type: 'user-join',
         user: {
           id: myUserId,
           color: selectedColor
         }
+      });
+
+      // Request current canvas state
+      conn.send({
+        type: 'request-canvas-state'
       });
     });
 
@@ -140,6 +209,15 @@ const Block: React.FC<BlockProps> = ({ title = "Collaborative Whiteboard", descr
         newUsers.delete(conn.peer);
         return newUsers;
       });
+      setUserCursors(prev => {
+        const newCursors = new Map(prev);
+        newCursors.delete(conn.peer);
+        return newCursors;
+      });
+    });
+
+    conn.on('error', (err: any) => {
+      console.error('Connection error:', err);
     });
   };
 
@@ -148,8 +226,19 @@ const Block: React.FC<BlockProps> = ({ title = "Collaborative Whiteboard", descr
       case 'drawing':
         drawOnCanvas(data.drawingData);
         break;
-      case 'user-info':
+      case 'user-join':
         setUsers(prev => new Map(prev.set(senderId, data.user)));
+        // Send back our user info
+        const conn = connections.get(senderId);
+        if (conn) {
+          conn.send({
+            type: 'user-join',
+            user: {
+              id: myUserId,
+              color: selectedColor
+            }
+          });
+        }
         break;
       case 'cursor':
         setUserCursors(prev => new Map(prev.set(senderId, { x: data.x, y: data.y })));
@@ -157,13 +246,28 @@ const Block: React.FC<BlockProps> = ({ title = "Collaborative Whiteboard", descr
       case 'clear':
         clearCanvas();
         break;
+      case 'request-canvas-state':
+        // In a full implementation, you'd send the current canvas state
+        // For now, we'll just acknowledge
+        const requestConn = connections.get(senderId);
+        if (requestConn) {
+          requestConn.send({
+            type: 'canvas-state',
+            imageData: null // Would contain canvas data
+          });
+        }
+        break;
     }
   };
 
   const broadcastData = (data: any) => {
     connections.forEach(conn => {
       if (conn.open) {
-        conn.send(data);
+        try {
+          conn.send(data);
+        } catch (err) {
+          console.error('Failed to send data to peer:', err);
+        }
       }
     });
   };
@@ -205,6 +309,7 @@ const Block: React.FC<BlockProps> = ({ title = "Collaborative Whiteboard", descr
   const startDrawing = (e: React.MouseEvent<HTMLCanvasElement>) => {
     setIsDrawing(true);
     const coords = getCanvasCoordinates(e);
+    setLastMousePos(coords);
     
     const drawData: DrawingData = {
       x: coords.x,
@@ -224,20 +329,12 @@ const Block: React.FC<BlockProps> = ({ title = "Collaborative Whiteboard", descr
     if (!isDrawing) return;
 
     const coords = getCanvasCoordinates(e);
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-
-    const rect = canvas.getBoundingClientRect();
-    const prevCoords = {
-      x: e.clientX - rect.left,
-      y: e.clientY - rect.top
-    };
-
+    
     const drawData: DrawingData = {
       x: coords.x,
       y: coords.y,
-      prevX: prevCoords.x,
-      prevY: prevCoords.y,
+      prevX: lastMousePos.x,
+      prevY: lastMousePos.y,
       color: selectedColor,
       type: 'draw',
       userId: myUserId
@@ -245,6 +342,7 @@ const Block: React.FC<BlockProps> = ({ title = "Collaborative Whiteboard", descr
 
     drawOnCanvas(drawData);
     broadcastData({ type: 'drawing', drawingData: drawData });
+    setLastMousePos(coords);
   };
 
   const stopDrawing = () => {
@@ -253,12 +351,19 @@ const Block: React.FC<BlockProps> = ({ title = "Collaborative Whiteboard", descr
 
   const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
     const coords = getCanvasCoordinates(e);
-    broadcastData({ type: 'cursor', x: coords.x, y: coords.y });
+    
+    // Throttle cursor updates
+    const now = Date.now();
+    if (!handleMouseMove.lastUpdate || now - handleMouseMove.lastUpdate > 50) {
+      broadcastData({ type: 'cursor', x: coords.x, y: coords.y });
+      handleMouseMove.lastUpdate = now;
+    }
     
     if (isDrawing) {
       draw(e);
     }
   };
+  (handleMouseMove as any).lastUpdate = 0;
 
   const clearCanvas = () => {
     const canvas = canvasRef.current;
@@ -275,17 +380,43 @@ const Block: React.FC<BlockProps> = ({ title = "Collaborative Whiteboard", descr
     broadcastData({ type: 'clear' });
   };
 
+  const getStatusText = () => {
+    switch (connectionStatus) {
+      case 'connecting':
+        return 'Connecting...';
+      case 'connected':
+        return `Connected (${users.size} user${users.size !== 1 ? 's' : ''})`;
+      case 'disconnected':
+        return 'Disconnected';
+      default:
+        return 'Unknown';
+    }
+  };
+
+  const getStatusColor = () => {
+    switch (connectionStatus) {
+      case 'connecting':
+        return '#ff9800';
+      case 'connected':
+        return '#4CAF50';
+      case 'disconnected':
+        return '#f44336';
+      default:
+        return '#666';
+    }
+  };
+
   // Send completion event on first interaction
   useEffect(() => {
     const handleFirstInteraction = () => {
       window.postMessage({ 
         type: 'BLOCK_COMPLETION', 
-        blockId: '68531d5d157dfa0de308d05c', 
+        blockId: 'collaborative-whiteboard', 
         completed: true 
       }, '*');
       window.parent.postMessage({ 
         type: 'BLOCK_COMPLETION', 
-        blockId: '68531d5d157dfa0de308d05c', 
+        blockId: 'collaborative-whiteboard', 
         completed: true 
       }, '*');
     };
@@ -325,10 +456,10 @@ const Block: React.FC<BlockProps> = ({ title = "Collaborative Whiteboard", descr
               width: '10px', 
               height: '10px', 
               borderRadius: '50%', 
-              backgroundColor: isConnected ? '#4CAF50' : '#f44336'
+              backgroundColor: getStatusColor()
             }}></div>
             <span style={{ fontSize: '14px', color: '#666' }}>
-              {isConnected ? `Connected (${users.size} users)` : 'Connecting...'}
+              {getStatusText()}
             </span>
           </div>
           <button
@@ -352,7 +483,8 @@ const Block: React.FC<BlockProps> = ({ title = "Collaborative Whiteboard", descr
         display: 'flex', 
         gap: '10px', 
         marginBottom: '20px',
-        alignItems: 'center'
+        alignItems: 'center',
+        flexWrap: 'wrap'
       }}>
         <span style={{ fontSize: '16px', fontWeight: 'bold', color: '#333' }}>Colors:</span>
         {COLORS.map((color, index) => (
@@ -371,24 +503,6 @@ const Block: React.FC<BlockProps> = ({ title = "Collaborative Whiteboard", descr
             title={`Color ${index + 1}`}
           />
         ))}
-        <div style={{ 
-          marginLeft: '20px',
-          padding: '8px 12px',
-          backgroundColor: '#f5f5f5',
-          borderRadius: '4px',
-          fontSize: '14px',
-          color: '#666'
-        }}>
-          Selected: <span style={{ 
-            display: 'inline-block',
-            width: '16px',
-            height: '16px',
-            backgroundColor: selectedColor,
-            borderRadius: '50%',
-            marginLeft: '5px',
-            verticalAlign: 'middle'
-          }}></span>
-        </div>
       </div>
 
       <div style={{ position: 'relative', display: 'inline-block' }}>
@@ -403,7 +517,7 @@ const Block: React.FC<BlockProps> = ({ title = "Collaborative Whiteboard", descr
           style={{
             border: '2px solid #ddd',
             borderRadius: '8px',
-            cursor: 'crosshair',
+            cursor: isDrawing ? 'none' : 'crosshair',
             backgroundColor: 'white',
             boxShadow: '0 2px 10px rgba(0,0,0,0.1)'
           }}
@@ -418,16 +532,17 @@ const Block: React.FC<BlockProps> = ({ title = "Collaborative Whiteboard", descr
               key={userId}
               style={{
                 position: 'absolute',
-                left: cursor.x - 5,
-                top: cursor.y - 5,
-                width: '10px',
-                height: '10px',
+                left: cursor.x - 8,
+                top: cursor.y - 8,
+                width: '16px',
+                height: '16px',
                 backgroundColor: user?.color || '#333',
                 borderRadius: '50%',
                 pointerEvents: 'none',
                 zIndex: 10,
                 border: '2px solid white',
-                boxShadow: '0 0 4px rgba(0,0,0,0.3)'
+                boxShadow: '0 2px 6px rgba(0,0,0,0.3)',
+                transform: 'translate(-50%, -50%)'
               }}
             />
           );
@@ -442,24 +557,53 @@ const Block: React.FC<BlockProps> = ({ title = "Collaborative Whiteboard", descr
       }}>
         <p>🎨 Draw with your mouse • Share this page with others to collaborate in real-time!</p>
         {users.size > 1 && (
-          <div style={{ marginTop: '10px' }}>
-            <strong>Active users:</strong> {Array.from(users.values()).map(user => (
-              <span key={user.id} style={{ 
-                marginLeft: '10px',
-                display: 'inline-flex',
-                alignItems: 'center',
-                gap: '5px'
-              }}>
-                <span style={{ 
-                  width: '12px', 
-                  height: '12px', 
-                  backgroundColor: user.color,
-                  borderRadius: '50%',
-                  display: 'inline-block'
-                }}></span>
-                {user.id === myUserId ? 'You' : user.id.substring(0, 8)}
-              </span>
-            ))}
+          <div style={{ 
+            marginTop: '10px',
+            padding: '10px',
+            backgroundColor: '#f8f9fa',
+            borderRadius: '6px',
+            border: '1px solid #e9ecef'
+          }}>
+            <strong>Active collaborators:</strong>
+            <div style={{ 
+              marginTop: '5px',
+              display: 'flex',
+              justifyContent: 'center',
+              flexWrap: 'wrap',
+              gap: '10px'
+            }}>
+              {Array.from(users.values()).map(user => (
+                <span key={user.id} style={{ 
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '5px',
+                  padding: '4px 8px',
+                  backgroundColor: 'white',
+                  borderRadius: '12px',
+                  border: '1px solid #ddd'
+                }}>
+                  <span style={{ 
+                    width: '12px', 
+                    height: '12px', 
+                    backgroundColor: user.color,
+                    borderRadius: '50%',
+                    display: 'inline-block'
+                  }}></span>
+                  {user.id === myUserId ? 'You' : `User ${user.id.substring(0, 6)}`}
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
+        {connectionStatus === 'connected' && users.size === 1 && (
+          <div style={{ 
+            marginTop: '10px',
+            padding: '8px',
+            backgroundColor: '#fff3cd',
+            borderRadius: '4px',
+            color: '#856404'
+          }}>
+            💡 You're the only one here. Share this page with others to start collaborating!
           </div>
         )}
       </div>
